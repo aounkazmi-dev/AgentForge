@@ -89,7 +89,7 @@ if user_input:
             )
         )
 
-    # first add the message to message_history
+   
     st.session_state["message_history"].append(
         {
             "role": "assistant",
