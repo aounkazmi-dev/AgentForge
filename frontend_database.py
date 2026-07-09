@@ -6,7 +6,7 @@ from langgraph_database_backend import retrive_all_threads
 
 
 st.set_page_config(
-    page_title="Data Buddy",
+    page_title="Chat Buddy",
     page_icon="💬",
     layout="centered",
     initial_sidebar_state="expanded",
