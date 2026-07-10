@@ -2,12 +2,12 @@ from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
-import sqlite3
 import re
 import io
 import contextlib
@@ -19,10 +19,6 @@ import plotly.graph_objects as go
 
 load_dotenv()
 
-# NEW: switched from Gemini to Groq/Llama. The Gemini-specific workarounds
-# (thinking_budget, the MALFORMED_FUNCTION_CALL retry loop) were needed for
-# gemini-2.5-flash's specific quirks and don't apply here — Llama's
-# function-calling doesn't have that bug, so we drop those.
 llm = ChatGroq(
     model="meta-llama/llama-4-scout-17b-16e-instruct",
     temperature=0,
@@ -36,30 +32,72 @@ class ChatState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-#  SQL tool (same as Phase 3)
+#  NEW: per-thread (per-user-session) storage, instead of shared globals
 # ---------------------------------------------------------------------------
-_active_con = None
+# Previously _active_df / _active_con / _last_figure were single module-level
+# variables — fine for one person testing locally, but on a deployed app
+# with more than one visitor at a time, User A's dataset could silently get
+# overwritten by User B's upload, and each would see the wrong tool results.
+#
+# The fix: keep a dict keyed by thread_id (already unique per browser session
+# in this app), and have tools automatically receive the current thread_id
+# via RunnableConfig — LangChain/LangGraph auto-injects a parameter typed
+# `config: RunnableConfig` into a tool call without the LLM ever seeing or
+# needing to fill it in, since it's not part of the tool's exposed schema.
+_session_dataframes: dict = {}
+_session_connections: dict = {}
+_session_figures: dict = {}
 
 
-def set_active_connection(con):
-    """Call this once, right after data_ingestion.ingest() runs, so the SQL
-    tool below has something to query against."""
-    global _active_con
-    _active_con = con
+def _thread_id_from_config(config: RunnableConfig) -> str:
+    """Pull the current thread_id out of the run config, with a fallback
+    so nothing crashes if a tool is ever called without one."""
+    if not config:
+        return "default"
+    return config.get("configurable", {}).get("thread_id", "default")
 
 
+def set_active_dataframe(df, thread_id: str):
+    """Call this once per upload (with the CURRENT session's thread_id),
+    right after data_ingestion.ingest() runs."""
+    _session_dataframes[thread_id] = df
+
+
+def set_active_connection(con, thread_id: str):
+    """Call this once per upload (with the CURRENT session's thread_id),
+    right after data_ingestion.ingest() runs."""
+    _session_connections[thread_id] = con
+
+
+def get_last_figure(thread_id: str):
+    """Frontend calls this after invoking the graph to get the most recently
+    created chart for THIS thread, or None if no chart was created."""
+    return _session_figures.get(thread_id)
+
+
+def clear_last_figure(thread_id: str):
+    """Frontend calls this before each new user turn, so an old chart from
+    a previous question doesn't get shown again by mistake."""
+    _session_figures[thread_id] = None
+
+
+# ---------------------------------------------------------------------------
+#  SQL tool
+# ---------------------------------------------------------------------------
 @tool
-def run_sql(query: str) -> str:
+def run_sql(query: str, config: RunnableConfig) -> str:
     """Run a read-only SQL query against the 'data' table (DuckDB syntax)
     and return the result as text. Use this whenever the user's question
     requires aggregation, filtering, sorting, or computing something from
     the dataset rather than just describing its structure. The table is
     always called 'data'. Example: SELECT city, AVG(salary) AS avg_salary
     FROM data GROUP BY city ORDER BY avg_salary DESC LIMIT 1."""
-    if _active_con is None:
+    thread_id = _thread_id_from_config(config)
+    con = _session_connections.get(thread_id)
+    if con is None:
         return "No dataset is currently loaded. Ask the user to upload a file first."
     try:
-        result_df = _active_con.sql(query).df()
+        result_df = con.sql(query).df()
         if result_df.empty:
             return "The query ran successfully but returned no rows."
         return result_df.to_string(index=False)
@@ -68,50 +106,38 @@ def run_sql(query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Structured stats tools (replaces free-form run_python)
+#  Structured stats tools
 # ---------------------------------------------------------------------------
-# NEW APPROACH: instead of asking the LLM to write arbitrary Python code as
-# a string argument (which reliably triggers Gemini's MALFORMED_FUNCTION_CALL
-# for code-like content), each statistical operation is its own tool with
-# plain, simple arguments — just column names and operation names. This is
-# both more reliable for function-calling AND safer (no exec() of arbitrary
-# code at all for these common operations).
-_active_df = None
-
-
-def set_active_dataframe(df):
-    """Call this once, right after data_ingestion.ingest() runs, so the
-    stats tools below have a DataFrame to analyze."""
-    global _active_df
-    _active_df = df
-
-
 @tool
-def compute_correlation(column_a: str, column_b: str) -> str:
+def compute_correlation(column_a: str, column_b: str, config: RunnableConfig) -> str:
     """Compute the Pearson correlation coefficient between two numeric
     columns in the dataset. Use this when the user asks whether two
     columns are related, correlated, or move together."""
-    if _active_df is None:
+    thread_id = _thread_id_from_config(config)
+    df = _session_dataframes.get(thread_id)
+    if df is None:
         return "No dataset is currently loaded."
     try:
-        corr = _active_df[column_a].corr(_active_df[column_b])
+        corr = df[column_a].corr(df[column_b])
         return f"Correlation coefficient between '{column_a}' and '{column_b}': {corr:.4f}"
     except Exception as e:
         return f"Error computing correlation: {e}. Check that both column names exist and are numeric."
 
 
 @tool
-def describe_column(column: str) -> str:
+def describe_column(column: str, config: RunnableConfig) -> str:
     """Get summary statistics for a single column: count, mean, std, min,
     max, and quartiles for numeric columns, or value counts for
     categorical/text columns. Use this for 'describe', 'summarize', or
     'distribution of' style questions about one column."""
-    if _active_df is None:
+    thread_id = _thread_id_from_config(config)
+    df = _session_dataframes.get(thread_id)
+    if df is None:
         return "No dataset is currently loaded."
     try:
-        if column not in _active_df.columns:
-            return f"Column '{column}' not found. Available columns: {list(_active_df.columns)}"
-        series = _active_df[column]
+        if column not in df.columns:
+            return f"Column '{column}' not found. Available columns: {list(df.columns)}"
+        series = df[column]
         if pd.api.types.is_numeric_dtype(series):
             return series.describe().to_string()
         else:
@@ -121,20 +147,22 @@ def describe_column(column: str) -> str:
 
 
 @tool
-def run_ttest(numeric_column: str, group_column: str) -> str:
+def run_ttest(numeric_column: str, group_column: str, config: RunnableConfig) -> str:
     """Run an independent two-sample t-test comparing a numeric column
     across exactly two groups defined by a categorical column. Use this
     when the user asks if there's a statistically significant difference
     between two groups (e.g. 'is salary different between two cities?').
     The group_column must have exactly two unique values for this to work."""
-    if _active_df is None:
+    thread_id = _thread_id_from_config(config)
+    df = _session_dataframes.get(thread_id)
+    if df is None:
         return "No dataset is currently loaded."
     try:
-        groups = _active_df[group_column].dropna().unique()
+        groups = df[group_column].dropna().unique()
         if len(groups) != 2:
             return f"'{group_column}' has {len(groups)} unique groups, but a t-test needs exactly 2. Groups found: {list(groups)}"
-        sample_a = _active_df[_active_df[group_column] == groups[0]][numeric_column].dropna()
-        sample_b = _active_df[_active_df[group_column] == groups[1]][numeric_column].dropna()
+        sample_a = df[df[group_column] == groups[0]][numeric_column].dropna()
+        sample_b = df[df[group_column] == groups[1]][numeric_column].dropna()
         t_stat, p_value = stats.ttest_ind(sample_a, sample_b)
         return (
             f"T-test comparing '{numeric_column}' between {group_column}='{groups[0]}' "
@@ -146,34 +174,10 @@ def run_ttest(numeric_column: str, group_column: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  NEW: Visualization tool
+#  Visualization tool
 # ---------------------------------------------------------------------------
-# A chart is different from everything before it: run_sql/compute_correlation
-# etc. all return TEXT the LLM reads and talks about. A chart is an OBJECT —
-# the LLM can't "see" a Plotly figure, and printing it as text is useless.
-# So this tool does two things: (1) gives the LLM a short text confirmation
-# to talk about, and (2) stashes the actual figure (as JSON) in a
-# module-level variable, completely separate from the message history, for
-# the frontend to pick up and render later (that wiring happens in Phase 8).
-_last_figure = None
-
-
-def get_last_figure():
-    """Frontend calls this after invoking the graph to get the most recently
-    created chart (as a Plotly-compatible JSON string), or None if no chart
-    was created on that turn."""
-    return _last_figure
-
-
-def clear_last_figure():
-    """Frontend calls this before each new user turn, so an old chart from
-    a previous question doesn't get shown again by mistake."""
-    global _last_figure
-    _last_figure = None
-
-
 @tool
-def create_chart(chart_type: str, x_column: str, y_column: str = "", agg: str = "", color_column: str = "") -> str:
+def create_chart(chart_type: str, x_column: str, config: RunnableConfig, y_column: str = "", agg: str = "", color_column: str = "") -> str:
     """Create a chart to visualize the dataset. chart_type must be one of:
     'bar', 'line', 'scatter', 'histogram', 'box'. x_column is required.
     y_column is required for bar/line/scatter/box, not used for histogram.
@@ -182,10 +186,11 @@ def create_chart(chart_type: str, x_column: str, y_column: str = "", agg: str = 
     'average salary by city' -> chart_type='bar', x_column='city',
     y_column='salary', agg='mean'). color_column (optional) splits the
     chart into colored groups by another column."""
-    if _active_df is None:
+    thread_id = _thread_id_from_config(config)
+    df = _session_dataframes.get(thread_id)
+    if df is None:
         return "No dataset is currently loaded."
 
-    df = _active_df
     color = color_column or None
     try:
         if agg and y_column and chart_type in ("bar", "line"):
@@ -206,8 +211,7 @@ def create_chart(chart_type: str, x_column: str, y_column: str = "", agg: str = 
         else:
             return f"Unknown chart_type '{chart_type}'. Use one of: bar, line, scatter, histogram, box."
 
-        global _last_figure
-        _last_figure = fig.to_json()
+        _session_figures[thread_id] = fig.to_json()
 
         desc = f"Created a {chart_type} chart, x={x_column}"
         if y_column:
@@ -220,20 +224,82 @@ def create_chart(chart_type: str, x_column: str, y_column: str = "", agg: str = 
         return f"Error creating chart: {e}. Check that the column names exist in the dataset."
 
 
-# Bind all tools to the LLM
-llm_with_tools = llm.bind_tools([run_sql, compute_correlation, describe_column, run_ttest, create_chart])
+# ---------------------------------------------------------------------------
+#  Insight/Report tool
+# ---------------------------------------------------------------------------
+@tool
+def generate_data_report(config: RunnableConfig) -> str:
+    """Generate a comprehensive overview of the entire dataset: descriptive
+    statistics for all numeric columns, a missing-value summary, the
+    strongest correlations between numeric columns, and category breakdowns
+    for text/categorical columns. Use this when the user asks for a
+    'report', 'summary', 'overview', 'key insights', or to 'analyze the
+    whole dataset' — as opposed to a question about one specific column
+    or relationship, which the other tools handle better."""
+    thread_id = _thread_id_from_config(config)
+    df = _session_dataframes.get(thread_id)
+    if df is None:
+        return "No dataset is currently loaded."
+
+    lines = [f"Dataset shape: {df.shape[0]} rows, {df.shape[1]} columns", ""]
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in df.columns if c not in numeric_cols]
+
+    if numeric_cols:
+        lines.append("=== Numeric column summary ===")
+        lines.append(df[numeric_cols].describe().to_string())
+        lines.append("")
+
+    null_counts = df.isnull().sum()
+    null_counts = null_counts[null_counts > 0]
+    if not null_counts.empty:
+        lines.append("=== Missing values ===")
+        lines.append(null_counts.to_string())
+        lines.append("")
+    else:
+        lines.append("=== Missing values ===")
+        lines.append("None — the dataset has no missing values.")
+        lines.append("")
+
+    if len(numeric_cols) >= 2:
+        corr_matrix = df[numeric_cols].corr()
+        seen_pairs = set()
+        scored_pairs = []
+        for col_a in numeric_cols:
+            for col_b in numeric_cols:
+                if col_a == col_b:
+                    continue
+                pair_key = frozenset([col_a, col_b])
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                corr_value = corr_matrix.loc[col_a, col_b]
+                scored_pairs.append((col_a, col_b, corr_value))
+        scored_pairs.sort(key=lambda item: abs(item[2]), reverse=True)
+
+        if scored_pairs:
+            lines.append("=== Strongest correlations ===")
+            for col_a, col_b, corr_value in scored_pairs[:3]:
+                lines.append(f"{col_a} vs {col_b}: {corr_value:.3f}")
+            lines.append("")
+
+    if cat_cols:
+        lines.append("=== Categorical column breakdowns (top values) ===")
+        for col in cat_cols[:5]:
+            lines.append(f"-- {col} --")
+            lines.append(df[col].value_counts().head(5).to_string())
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+llm_with_tools = llm.bind_tools([run_sql, compute_correlation, describe_column, run_ttest, create_chart, generate_data_report])
 
 
 # ---------------------------------------------------------------------------
-#  NEW: text-based code fallback (the answer to "endless possibilities")
+#  Text-based code fallback
 # ---------------------------------------------------------------------------
-# Instead of asking the LLM to pass code AS A TOOL ARGUMENT (which goes
-# through Gemini's strict function-call JSON encoding and reliably breaks —
-# that's what MALFORMED_FUNCTION_CALL was), we let the LLM write a python
-# code block in its normal reply text when none of the structured tools fit.
-# We detect that block ourselves and execute it. No function-calling schema
-# is involved for the code at all, so the encoding bug never triggers.
-
 _SAFE_BUILTINS = {
     "print": print, "len": len, "range": range, "sum": sum, "min": min,
     "max": max, "sorted": sorted, "abs": abs, "round": round, "list": list,
@@ -244,9 +310,9 @@ _SAFE_BUILTINS = {
 
 
 def get_text_content(content) -> str:
-    """Gemini sometimes returns content as a string, sometimes as a list of
-    {'type': 'text', 'text': ...} blocks (you saw this back in Phase 3's
-    output). This normalizes either shape into a plain string."""
+    """Normalizes content that might be a plain string or a list of
+    {'type': 'text', 'text': ...} blocks (a shape some providers use)
+    into a plain string."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -268,21 +334,23 @@ def extract_python_code(text: str):
     return match.group(1) if match else None
 
 
-def code_exec_node(state: ChatState):
+def code_exec_node(state: ChatState, config: RunnableConfig):
     """Runs whatever python code block the LLM just wrote in plain text,
-    then feeds the printed output back in as a new message so chat_node
-    can turn it into a final answer on the next loop."""
+    using THIS thread's dataframe, then feeds the printed output back in
+    as a new message so chat_node can turn it into a final answer."""
+    thread_id = _thread_id_from_config(config)
+    df = _session_dataframes.get(thread_id)
+
     last_msg = state["messages"][-1]
     text = get_text_content(last_msg.content)
     code = extract_python_code(text)
 
     if not code:
-        # Shouldn't happen given our routing, but fail safe rather than crash.
         return {"messages": [HumanMessage(content="[Code execution] No code block found to run.")]}
 
     safe_globals = {
         "__builtins__": _SAFE_BUILTINS,
-        "df": _active_df,
+        "df": df,
         "pd": pd,
         "np": np,
         "stats": stats,
@@ -295,20 +363,13 @@ def code_exec_node(state: ChatState):
             exec(code, safe_globals)
         output = output_buffer.getvalue().strip() or "Code ran successfully but printed nothing."
 
-        # NEW: if the code created a variable called `fig` that's a real
-        # Plotly figure, capture it the same way create_chart does — this
-        # covers custom charts too unusual for the structured tool.
         maybe_fig = safe_globals.get("fig")
         if isinstance(maybe_fig, go.Figure):
-            global _last_figure
-            _last_figure = maybe_fig.to_json()
+            _session_figures[thread_id] = maybe_fig.to_json()
             output += "\n\nA chart was created and is ready to display to the user."
     except Exception as e:
         output = f"Error running the code: {e}"
 
-    # NEW: fed back as a HumanMessage (not a ToolMessage, since this isn't a
-    # real LangChain tool call) so chat_node's next invoke sees it as new
-    # information to respond to.
     return {"messages": [HumanMessage(
         content=f"[Code execution result]\n{output}\n\nNow give the user a clear, final answer based on this result. Do not write more code unless it's truly necessary."
     )]}
@@ -343,7 +404,13 @@ def chat_node(state: ChatState):
             "4. run_ttest — for testing if a numeric column differs "
             "significantly between two groups.\n"
             "5. create_chart — for visualizing the data as a bar, line, "
-            "scatter, histogram, or box chart.\n\n"
+            "scatter, histogram, or box chart.\n"
+            "6. generate_data_report — for an overall summary/report of "
+            "the whole dataset (descriptive stats, missing values, top "
+            "correlations, category breakdowns). When you use this tool, "
+            "don't just repeat the numbers back — write a short business-"
+            "insight narrative: what stands out, what's worth investigating "
+            "further, and what it might mean.\n\n"
             "If none of these tools fit what's being asked, you may instead "
             "write a single python code block (```python ... ```) using the "
             "pandas DataFrame `df`, plus `pd`, `np`, `stats` (scipy.stats), "
@@ -351,7 +418,7 @@ def chat_node(state: ChatState):
             "all available. Use print() for anything you want to see back. "
             "If you create a chart this way, assign it to a variable named "
             "exactly `fig` and it will be displayed automatically. Only do "
-            "this when the 5 tools above genuinely don't cover the "
+            "this when the 6 tools above genuinely don't cover the "
             "question — prefer the structured tools whenever they fit.\n\n"
             f"Schema:\n{schema_summary}\n\n"
             "When the user just asks about the structure of the data, you "
@@ -361,16 +428,10 @@ def chat_node(state: ChatState):
     else:
         llm_input = messages
 
-    # NEW: Groq's function-calling is stricter than Gemini's — if the model
-    # tries to write free-form text/code instead of cleanly calling a tool
-    # while tools are bound, Groq raises a hard error (tool_use_failed)
-    # instead of just returning the text. When that happens, we retry the
-    # same messages WITHOUT tools bound, so the model can finish writing
-    # its text/code answer normally. route_after_agent will then detect
-    # the code block in that plain response, same as always.
     try:
         response = llm_with_tools.invoke(llm_input)
     except Exception as e:
+        print(f"\n[chat_node] llm_with_tools.invoke failed: {e}\n")
         if "tool_use_failed" in str(e) or "Failed to call a function" in str(e):
             response = llm.invoke(llm_input)
         else:
@@ -378,28 +439,22 @@ def chat_node(state: ChatState):
     return {"messages": [response]}
 
 
-conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
-checkpointer = SqliteSaver(conn=conn)
+# NEW: in-memory checkpointer instead of a SQLite file. Conversation state
+# now only lives as long as the server process is running — a browser
+# refresh gets a brand new thread_id (see the frontend), so there's nothing
+# stale to accidentally reload and error out on. A real server restart wipes
+# everything cleanly too, since there's no file left behind to reopen.
+checkpointer = MemorySaver()
 
 graph = StateGraph(ChatState)
 
 graph.add_node("chat_node", chat_node)
-graph.add_node("tools", ToolNode([run_sql, compute_correlation, describe_column, run_ttest, create_chart]))
-# NEW: the text-based code fallback node
+graph.add_node("tools", ToolNode([run_sql, compute_correlation, describe_column, run_ttest, create_chart, generate_data_report]))
 graph.add_node("code_exec", code_exec_node)
 
 graph.add_edge(START, "chat_node")
-# NEW: route_after_agent checks for a real tool call OR a code block in the text
 graph.add_conditional_edges("chat_node", route_after_agent, {"tools": "tools", "code_exec": "code_exec", END: END})
 graph.add_edge("tools", "chat_node")
 graph.add_edge("code_exec", "chat_node")
 
 chatbot = graph.compile(checkpointer=checkpointer)
-
-
-def retrive_all_threads():
-    all_threads = set()
-    for checkpoint in checkpointer.list(None):
-        all_threads.add(checkpoint.config['configurable']['thread_id'])
-
-    return list(all_threads)

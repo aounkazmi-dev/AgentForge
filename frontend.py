@@ -1,7 +1,6 @@
 import streamlit as st
-from langgraph_database_backend_phase5 import (
+from backend import (
     chatbot,
-    retrive_all_threads,
     set_active_connection,
     set_active_dataframe,
     get_last_figure,
@@ -181,7 +180,10 @@ if "message_history" not in st.session_state:
 if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 if "thread_history" not in st.session_state:
-    st.session_state["thread_history"] = retrive_all_threads()
+    # NEW: always start empty. Every browser refresh is a genuinely fresh
+    # session now — no old threads from this or any other visitor get
+    # pulled in, so there's nothing stale to click into and error out on.
+    st.session_state["thread_history"] = []
 # NEW: dataset state
 if "df" not in st.session_state:
     st.session_state["df"] = None
@@ -216,13 +218,18 @@ if uploaded_file is not None:
     # a Streamlit rerun of the same one (reruns happen on every interaction)
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
     if st.session_state["uploaded_file_id"] != file_id:
-        file_bytes = uploaded_file.read()
-        df, con, schema_summary = ingest(file_bytes, uploaded_file.name)
-        st.session_state["df"] = df
-        st.session_state["con"] = con
-        st.session_state["schema_summary"] = schema_summary
-        st.session_state["uploaded_file_id"] = file_id
-        st.success(f"Loaded {uploaded_file.name} — {df.shape[0]} rows, {df.shape[1]} columns.")
+        try:
+            file_bytes = uploaded_file.read()
+            df, con, schema_summary = ingest(file_bytes, uploaded_file.name)
+            st.session_state["df"] = df
+            st.session_state["con"] = con
+            st.session_state["schema_summary"] = schema_summary
+            st.session_state["uploaded_file_id"] = file_id
+            st.success(f"Loaded {uploaded_file.name} — {df.shape[0]} rows, {df.shape[1]} columns.")
+        except Exception as e:
+            # NEW: a malformed/corrupted file would otherwise crash the whole
+            # page with a raw traceback. Show a friendly message instead.
+            st.error(f"Couldn't read this file: {e}. Try a different CSV/Excel file.")
 
     # NEW: small preview so the user can see what's loaded
     with st.expander("Preview data"):
@@ -257,31 +264,35 @@ if user_input:
     with st.chat_message("user"):
         st.write(user_input)
 
-    # NEW: point the tools at whatever dataset is currently loaded in this
-    # session, right before invoking the graph. See the note at the top of
-    # this phase about this being a single shared variable in the backend —
-    # fine for one user at a time, revisited in Phase 9 for multi-user use.
+    # NEW (Phase 9): pass the CURRENT thread_id into every one of these
+    # calls. The backend now keeps a separate dataset/figure per thread_id
+    # instead of one shared variable, so two people using the deployed app
+    # at the same time no longer see each other's data.
+    current_thread_id = str(st.session_state["thread_id"])
     if st.session_state["df"] is not None:
-        set_active_dataframe(st.session_state["df"])
+        set_active_dataframe(st.session_state["df"], current_thread_id)
     if st.session_state["con"] is not None:
-        set_active_connection(st.session_state["con"])
-    clear_last_figure()
+        set_active_connection(st.session_state["con"], current_thread_id)
+    clear_last_figure(current_thread_id)
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            result = chatbot.invoke(
-                {
-                    "messages": [HumanMessage(content=user_input)],
-                    "schema_summary": st.session_state["schema_summary"],
-                },
-                config=CONFIG,
-            )
+            # NEW: only include schema_summary in the input when THIS session
+            # actually has one loaded. If we always sent it — even when blank
+            # after a refresh — we'd silently overwrite the good schema text
+            # already saved in this thread's checkpoint. Omitting the key
+            # entirely lets LangGraph keep whatever was last checkpointed.
+            graph_input = {"messages": [HumanMessage(content=user_input)]}
+            if st.session_state["schema_summary"]:
+                graph_input["schema_summary"] = st.session_state["schema_summary"]
+
+            result = chatbot.invoke(graph_input, config=CONFIG)
 
         ai_content = get_text_content(result["messages"][-1].content)
         st.write(ai_content)
 
-        # NEW: pick up any chart the agent created this turn
-        fig_json = get_last_figure()
+        # NEW: pick up any chart the agent created this turn, for THIS thread
+        fig_json = get_last_figure(current_thread_id)
         if fig_json:
             fig = pio.from_json(fig_json)
             st.plotly_chart(fig, use_container_width=True)
