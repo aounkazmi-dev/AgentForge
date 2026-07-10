@@ -2,11 +2,11 @@ from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
+from langchain_groq import ChatGroq
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
 import sqlite3
 import re
 import io
@@ -19,12 +19,12 @@ import plotly.graph_objects as go
 
 load_dotenv()
 
-# NEW: max_output_tokens raised from the default (~1024). gemini-2.5-flash
-# spends part of its output budget on internal "thinking" before writing
-# the visible answer or a tool call — with a small budget, it can burn
-# all of it thinking and return an empty message, which is what you saw.
+# NEW: switched from Gemini to Groq/Llama. The Gemini-specific workarounds
+# (thinking_budget, the MALFORMED_FUNCTION_CALL retry loop) were needed for
+# gemini-2.5-flash's specific quirks and don't apply here — Llama's
+# function-calling doesn't have that bug, so we drop those.
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="meta-llama/llama-4-scout-17b-16e-instruct",
     temperature=0,
     max_tokens=4096,
 )
@@ -361,19 +361,20 @@ def chat_node(state: ChatState):
     else:
         llm_input = messages
 
-    # NEW: Gemini occasionally returns finish_reason == MALFORMED_FUNCTION_CALL
-    # for tool calls with code-like string arguments (quotes/newlines confuse
-    # its own function-call encoding). This is usually transient, so we just
-    # retry the same request a couple of times before giving up.
-    max_attempts = 3
-    response = None
-    for attempt in range(max_attempts):
+    # NEW: Groq's function-calling is stricter than Gemini's — if the model
+    # tries to write free-form text/code instead of cleanly calling a tool
+    # while tools are bound, Groq raises a hard error (tool_use_failed)
+    # instead of just returning the text. When that happens, we retry the
+    # same messages WITHOUT tools bound, so the model can finish writing
+    # its text/code answer normally. route_after_agent will then detect
+    # the code block in that plain response, same as always.
+    try:
         response = llm_with_tools.invoke(llm_input)
-        finish_reason = getattr(response, "response_metadata", {}).get("finish_reason")
-        if finish_reason != "MALFORMED_FUNCTION_CALL":
-            break
-        print(f"  [retry] MALFORMED_FUNCTION_CALL on attempt {attempt + 1}/{max_attempts}, retrying...")
-
+    except Exception as e:
+        if "tool_use_failed" in str(e) or "Failed to call a function" in str(e):
+            response = llm.invoke(llm_input)
+        else:
+            raise
     return {"messages": [response]}
 
 

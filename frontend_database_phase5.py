@@ -145,7 +145,14 @@ st.markdown(
 
 #    ---------helpers
 def generate_thread_id():
-    return uuid.uuid4()
+    # NEW: always a plain string. Previously this returned a uuid.UUID
+    # object, while retrive_all_threads() returns strings (that's how
+    # they're stored/read back from SQLite). Mixing UUID objects and
+    # strings in thread_history caused inconsistent comparisons and
+    # thread_id values across session-created vs. loaded threads —
+    # this is very likely what caused the "weird after switching chats"
+    # behavior.
+    return str(uuid.uuid4())
 
 def reset_chat():
     st.session_state["message_history"] = []
