@@ -2,11 +2,11 @@ from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
+from langchain_groq import ChatGroq
 import sqlite3
 import re
 import io
@@ -23,14 +23,10 @@ load_dotenv()
 # spends part of its output budget on internal "thinking" before writing
 # the visible answer or a tool call — with a small budget, it can burn
 # all of it thinking and return an empty message, which is what you saw.
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    max_output_tokens=4096,
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
     temperature=0,
-    thinking_budget=0,  # NEW: try disabling internal "thinking" — if this
-                        # line throws a TypeError (unsupported kwarg on your
-                        # installed langchain-google-genai version), just
-                        # delete this line and tell me the version you have.
+    max_tokens=4096,
 )
 
 
