@@ -1,12 +1,7 @@
 import streamlit as st
-from backend import (
-    chatbot,
-    set_active_connection,
-    set_active_dataframe,
-    get_last_figure,
-    clear_last_figure,
-    get_text_content,
-)
+from backend import chatbot
+from tools import set_active_connection, set_active_dataframe, get_last_figure, clear_last_figure
+from utils import get_text_content
 from langchain_core.messages import HumanMessage
 from data_ingestion import ingest
 import plotly.io as pio
@@ -144,13 +139,7 @@ st.markdown(
 
 #    ---------helpers
 def generate_thread_id():
-    # NEW: always a plain string. Previously this returned a uuid.UUID
-    # object, while retrive_all_threads() returns strings (that's how
-    # they're stored/read back from SQLite). Mixing UUID objects and
-    # strings in thread_history caused inconsistent comparisons and
-    # thread_id values across session-created vs. loaded threads —
-    # this is very likely what caused the "weird after switching chats"
-    # behavior.
+
     return str(uuid.uuid4())
 
 def reset_chat():
@@ -168,8 +157,6 @@ def load_conversation(thread_id):
     result = []
     for msg in messages:
         role = "user" if msg.type == "human" else "assistant"
-        # NEW: use get_text_content since Gemini sometimes returns content
-        # as a list of {'type': 'text', ...} blocks instead of a plain string
         result.append({"role": role, "content": get_text_content(msg.content)})
     return result
 
@@ -180,11 +167,8 @@ if "message_history" not in st.session_state:
 if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 if "thread_history" not in st.session_state:
-    # NEW: always start empty. Every browser refresh is a genuinely fresh
-    # session now — no old threads from this or any other visitor get
-    # pulled in, so there's nothing stale to click into and error out on.
     st.session_state["thread_history"] = []
-# NEW: dataset state
+
 if "df" not in st.session_state:
     st.session_state["df"] = None
 if "con" not in st.session_state:
@@ -227,8 +211,7 @@ if uploaded_file is not None:
             st.session_state["uploaded_file_id"] = file_id
             st.success(f"Loaded {uploaded_file.name} — {df.shape[0]} rows, {df.shape[1]} columns.")
         except Exception as e:
-            # NEW: a malformed/corrupted file would otherwise crash the whole
-            # page with a raw traceback. Show a friendly message instead.
+
             st.error(f"Couldn't read this file: {e}. Try a different CSV/Excel file.")
 
     # NEW: small preview so the user can see what's loaded
@@ -238,7 +221,6 @@ if uploaded_file is not None:
 for message in st.session_state["message_history"]:
     with st.chat_message(message["role"]):
         st.write(message["content"])
-        # NEW: redisplay a chart if this message had one attached
         if message.get("figure"):
             fig = pio.from_json(message["figure"])
             st.plotly_chart(fig, use_container_width=True)
@@ -264,10 +246,6 @@ if user_input:
     with st.chat_message("user"):
         st.write(user_input)
 
-    # NEW (Phase 9): pass the CURRENT thread_id into every one of these
-    # calls. The backend now keeps a separate dataset/figure per thread_id
-    # instead of one shared variable, so two people using the deployed app
-    # at the same time no longer see each other's data.
     current_thread_id = str(st.session_state["thread_id"])
     if st.session_state["df"] is not None:
         set_active_dataframe(st.session_state["df"], current_thread_id)
@@ -277,11 +255,7 @@ if user_input:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            # NEW: only include schema_summary in the input when THIS session
-            # actually has one loaded. If we always sent it — even when blank
-            # after a refresh — we'd silently overwrite the good schema text
-            # already saved in this thread's checkpoint. Omitting the key
-            # entirely lets LangGraph keep whatever was last checkpointed.
+
             graph_input = {"messages": [HumanMessage(content=user_input)]}
             if st.session_state["schema_summary"]:
                 graph_input["schema_summary"] = st.session_state["schema_summary"]
@@ -291,7 +265,6 @@ if user_input:
         ai_content = get_text_content(result["messages"][-1].content)
         st.write(ai_content)
 
-        # NEW: pick up any chart the agent created this turn, for THIS thread
         fig_json = get_last_figure(current_thread_id)
         if fig_json:
             fig = pio.from_json(fig_json)
